@@ -1,0 +1,165 @@
+#!/bin/sh
+# VeloCloud Edge 520/540 port bring-up for Debian (systemd: velo540-switch.service).
+#
+# Port of /etc/init.d/velo540-switch from github.com/gallops-gannets/velo540openwrt
+# (register sequences unchanged), without uci/OpenWrt.  Settings: /etc/default/velo540
+#
+#   DSA_MASK=0  two plain 4-port switches: LAN1-4 on "swb" (00:14.1), LAN5-8 on "swa" (00:14.0)
+#   DSA_MASK=3  mv88e6xxx/DSA: every jack is its own interface lan1..lan8
+#
+# Needs: kernel 6.12.x-velo540 (patched igb + glue modules), mdio (mdio-tools,
+# static, /usr/sbin/mdio from velo540-tools) and the mdio-netlink module.
+
+MDIO=$(command -v mdio 2>/dev/null || echo /usr/local/sbin/mdio)
+DSA_MASK=0
+[ -r /etc/default/velo540 ] && . /etc/default/velo540
+
+log() { echo "velo540: $*"; }
+
+R() { $MDIO "$B" phy "$1" raw "$2"; }
+W() { $MDIO "$B" phy "$1" raw "$2" "$3"; }
+smiw() { W 0x1c 0x19 "$3"; W 0x1c 0x18 $(( 0x9400 | ($1 << 5) | $2 )); }
+smir() { W 0x1c 0x18 $(( 0x9800 | ($1 << 5) | $2 )); R 0x1c 0x19; }
+
+# Unmanaged mode: SerDes up, CPU port forced, PHYs on, ports 0-4 forwarding.
+switch_up() {
+	B="$1"
+	id=$(R 0x10 3 2>/dev/null) || { log "$B: no answer from switch"; return 1; }
+	case "$id" in 0x176*) ;; *) log "$B: no 88E6176 ($id)"; return 1;; esac
+
+	smiw 0xf 22 1
+	v=$(smir 0xf 0)
+	smiw 0xf 0 $(( (v | 0x8100) & ~0x1800 ))
+	sleep 1
+	st=$(R 0x14 0)
+	W 0x14 0 $(( st & ~0x1000 ))
+	W 0x14 1 0x000e
+
+	for d in 0 1 2 3; do
+		smiw $d 22 0
+		smiw $d 0 0x9140
+	done
+
+	for p in 0 1 2 3 4; do
+		a=$(( 0x10 + p )); c=$(R $a 4)
+		W $a 4 $(( (c & ~3) | 3 ))
+	done
+	for p in 5 6; do
+		a=$(( 0x10 + p )); c=$(R $a 4)
+		W $a 4 $(( c & ~3 ))
+	done
+	log "$B: 88E6176 $id up (unmanaged), port4 status $(R 0x14 0)"
+}
+
+# DSA mode: mv88e6xxx owns the switch; only re-force the CPU-side SerDes/port 4.
+cpu_link_up() {
+	B="$1"
+	st=$(R 0x14 0 2>/dev/null) || return 1
+	case "$st" in 0x?[89a-f]??) : ;; *)
+		smiw 0xf 22 1
+		v=$(smir 0xf 0)
+		smiw 0xf 0 $(( (v | 0x8100) & ~0x1800 ))
+		sleep 1
+		st=$(R 0x14 0);;
+	esac
+	W 0x14 0 $(( st & ~0x1000 ))
+	W 0x14 1 0x000e
+	log "$B: DSA CPU link, port4 status $(R 0x14 0)"
+}
+
+dsa_managed() { [ -e "/sys/bus/mdio_bus/devices/$1:00" ]; }
+
+gpiobase() {	# gpiochip base by label
+	for c in /sys/class/gpio/gpiochip*; do
+		[ "$(cat "$c/label" 2>/dev/null)" = "$1" ] && { echo "${c#*gpiochip}"; return 0; }
+	done
+	return 1
+}
+
+gpio_out() {	# gpio_out <number> <value>
+	[ -d "/sys/class/gpio/gpio$1" ] || echo "$1" > /sys/class/gpio/export
+	echo out > "/sys/class/gpio/gpio$1/direction"
+	echo "$2" > "/sys/class/gpio/gpio$1/value"
+}
+
+# WAN LEDs (vendor igb_vc_setup_m88e1514): LED0 = gigabit link, LED1 = 10/100 link+activity
+wan_leds() {
+	for a in 0 1; do
+		$MDIO gpio-0 phy $a raw 22 3
+		$MDIO gpio-0 phy $a raw 16 0x0817
+		$MDIO gpio-0 phy $a raw 17 0x0005
+		$MDIO gpio-0 phy $a raw 22 0
+	done
+}
+
+# GE1/GE2: 88E1514 PHYs held in reset by PCA9557@0x18 pin 4 on i2c-9.
+wan_up() {
+	[ -d /sys/bus/i2c/devices/i2c-9 ] || { log "i2c-9 (i2c-gpio) missing, WAN skipped"; return 1; }
+	[ -d /sys/bus/i2c/devices/9-0018 ] || echo pca9557 0x18 > /sys/bus/i2c/devices/i2c-9/new_device
+	sleep 1
+	base=$(gpiobase 9-0018) || { log "pca9557@0x18 gpiochip missing, WAN skipped"; return 1; }
+	if [ -e /sys/bus/pci/drivers/igb/0000:00:14.2 ] && [ -e /sys/bus/pci/drivers/igb/0000:00:14.3 ]; then
+		wan_leds
+		log "WAN PHYs already up, reset skipped"
+		return 0
+	fi
+	g=$(( base + 4 ))
+	gpio_out $g 0
+	sleep 1
+	echo 1 > /sys/class/gpio/gpio$g/value
+	sleep 1
+	for f in 0000:00:14.2 0000:00:14.3; do
+		[ -e /sys/bus/pci/drivers/igb/$f ] || echo $f > /sys/bus/pci/drivers/igb/bind 2>/dev/null
+	done
+	wan_leds
+	log "WAN PHY reset done, PHY ids: $($MDIO gpio-0 phy 0 raw 2) $($MDIO gpio-0 phy 1 raw 2)"
+}
+
+# Front logo LED outputs: SoC GPIO 39, active low.
+led_up() {
+	base=$(gpiobase gpio_ich) || return 0
+	gpio_out $(( base + 39 )) 0
+}
+
+start() {
+	[ -x "$MDIO" ] || { log "$MDIO missing"; exit 1; }
+	modprobe mdio-netlink
+	if [ "$DSA_MASK" != 0 ]; then
+		# DSA needs the full velo540 kernel (stock Debian kernels have no DSA)
+		modprobe tag_dsa 2>/dev/null
+		modprobe mv88e6xxx  # no modalias autoload for platform-data mdio devices
+		if modprobe vc-edge5x0-dsa dsa_mask="$DSA_MASK"; then
+			P=/sys/module/vc_edge5x0_dsa/parameters/dsa_mask
+			[ -w "$P" ] && [ "$(cat $P)" != "$DSA_MASK" ] && echo "$DSA_MASK" > "$P"
+			sleep 3
+		else
+			log "DSA_MASK=$DSA_MASK but vc-edge5x0-dsa is not available in this kernel; staying unmanaged"
+		fi
+	fi
+
+	n=0
+	for i in $(seq 1 20); do	# igb may still be probing
+		n=$(ls -d /sys/class/mdio_bus/igb-vc-* 2>/dev/null | wc -l)
+		[ "$n" -ge 2 ] && break
+		sleep 1
+	done
+	[ "$n" -ge 1 ] || log "no igb-vc-* MDIO buses: patched igb not active (see dmesg | grep -i edge5x0)"
+	for B in /sys/class/mdio_bus/igb-vc-*; do
+		[ -e "$B" ] || continue
+		B=$(basename "$B")
+		if dsa_managed "$B"; then cpu_link_up "$B"; else switch_up "$B"; fi
+	done
+	wan_up
+	led_up
+	return 0
+}
+
+case "${1:-start}" in
+start) start ;;
+status)
+	echo "DSA_MASK configured: $DSA_MASK, running: $(cat /sys/module/vc_edge5x0_dsa/parameters/dsa_mask 2>/dev/null || echo '-')"
+	ls /sys/class/mdio_bus/ 2>/dev/null
+	ip -br link
+	;;
+*) echo "usage: $0 start|status"; exit 1 ;;
+esac

@@ -1,0 +1,14 @@
+[Unit]
+Description=VeloCloud Edge 5x0 switch/WAN PHY bring-up
+After=systemd-modules-load.service systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/velo540-switch start
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,3 @@
+# 0 = two plain 4-port switches: swb = LAN1-4, swa = LAN5-8 (default, simplest)
+# 3 = DSA: every LAN jack is its own interface lan1..lan8
+DSA_MASK=0

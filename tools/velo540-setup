@@ -1,0 +1,34 @@
+#!/bin/sh
+# One-time GRUB setup for the VeloCloud Edge 520/540 (run as root):
+#  - serial console on ttyS1 (the micro-USB port, COM2), 115200
+#  - acpi_enforce_resources=lax (the glue modules use the SoC GPIO/LPC ranges)
+#  - make the newest -velo540 kernel the default even if a distro kernel is newer
+set -e
+[ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
+G=/etc/default/grub
+[ -f "$G" ] || { echo "no $G (GRUB not installed?)"; exit 1; }
+cp -n "$G" "$G.pre-velo540"
+
+add_arg() {
+	grep -q "^GRUB_CMDLINE_LINUX=.*$1" "$G" ||
+	    sed -i "s|^GRUB_CMDLINE_LINUX=\"|GRUB_CMDLINE_LINUX=\"$1 |" "$G"
+}
+add_arg "acpi_enforce_resources=lax"
+add_arg "console=ttyS1,115200n8"
+add_arg "console=tty0"
+grep -q '^GRUB_TERMINAL=' "$G" || echo 'GRUB_TERMINAL="serial console"' >> "$G"
+grep -q '^GRUB_SERIAL_COMMAND=' "$G" || echo 'GRUB_SERIAL_COMMAND="serial --unit=1 --speed=115200"' >> "$G"
+update-grub
+
+CFG=/boot/grub/grub.cfg
+sub=$(grep -o "submenu '[^']*' [^{]*\$menuentry_id_option '[^']*'" $CFG | head -n 1 |
+    sed "s/.*\$menuentry_id_option '\([^']*\)'/\1/")
+ent=$(grep -o "\$menuentry_id_option 'gnulinux-[^']*velo540[^']*-advanced-[^']*'" $CFG | head -n 1 |
+    sed "s/.*'\(gnulinux-[^']*\)'/\1/")
+if [ -n "$sub" ] && [ -n "$ent" ]; then
+	sed -i "s|^GRUB_DEFAULT=.*|GRUB_DEFAULT=\"$sub>$ent\"|" "$G"
+	update-grub
+	echo "GRUB default: $sub>$ent"
+else
+	echo "WARNING: no -velo540 entry in $CFG; is linux-image-velo540 installed?"
+fi
